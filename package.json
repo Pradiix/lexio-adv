@@ -1,0 +1,7 @@
+{
+  "name": "lexio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SaaS juridico para escritorios de advocacia",
+  "packageManager": "pnpm@10.0.0"
+}
