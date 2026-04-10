@@ -3,5 +3,14 @@
   "private": true,
   "version": "0.1.0",
   "description": "SaaS juridico para escritorios de advocacia",
-  "packageManager": "pnpm@10.0.0"
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace @lexio/api",
+    "build:api": "npm run build --workspace @lexio/api",
+    "start:api": "npm run start --workspace @lexio/api"
+  },
+  "packageManager": "npm@11.6.2"
 }

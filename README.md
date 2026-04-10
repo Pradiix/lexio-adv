@@ -21,3 +21,18 @@ Servicos previstos:
 - Postgres
 - Redis
 - n8n
+
+## API (Sprint 1)
+
+1. Instalar dependencias:
+   - `npm install`
+2. Rodar API:
+   - `npm run dev:api`
+3. Endpoints base:
+   - `GET /health`
+   - `POST /v1/tenants/bootstrap`
+   - `POST /v1/auth/login`
+   - `GET /v1/me`
+   - `POST /v1/users`
+   - `GET /v1/users`
+   - `GET /v1/audit-events`
