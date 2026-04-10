@@ -55,6 +55,69 @@ const auditListSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional()
 });
 
+const listQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  search: z.string().min(1).max(120).optional()
+});
+
+const contactStatusSchema = z.enum(["lead", "client", "archived"]);
+
+const contactCreateSchema = z.object({
+  fullName: z.string().min(2),
+  email: z.email().optional().nullable(),
+  phone: z.string().min(6).max(30).optional().nullable(),
+  whatsappId: z.string().min(3).max(80).optional().nullable(),
+  status: contactStatusSchema.optional(),
+  tags: z.array(z.string().min(1).max(40)).optional(),
+  notes: z.string().max(3000).optional().nullable()
+});
+
+const contactUpdateSchema = z
+  .object({
+    fullName: z.string().min(2).optional(),
+    email: z.email().optional().nullable(),
+    phone: z.string().min(6).max(30).optional().nullable(),
+    whatsappId: z.string().min(3).max(80).optional().nullable(),
+    status: contactStatusSchema.optional(),
+    tags: z.array(z.string().min(1).max(40)).optional(),
+    notes: z.string().max(3000).optional().nullable()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: "Nenhum campo para atualizar"
+  });
+
+const caseStatusSchema = z.enum([
+  "open",
+  "in_progress",
+  "waiting_client",
+  "closed",
+  "archived"
+]);
+const casePrioritySchema = z.enum(["low", "medium", "high", "urgent"]);
+
+const caseCreateSchema = z.object({
+  contactId: z.uuid(),
+  title: z.string().min(3).max(200),
+  description: z.string().max(5000).optional().nullable(),
+  practiceArea: z.string().min(2).max(80).optional().nullable(),
+  status: caseStatusSchema.optional(),
+  priority: casePrioritySchema.optional()
+});
+
+const caseUpdateSchema = z
+  .object({
+    contactId: z.uuid().optional(),
+    title: z.string().min(3).max(200).optional(),
+    description: z.string().max(5000).optional().nullable(),
+    practiceArea: z.string().min(2).max(80).optional().nullable(),
+    status: caseStatusSchema.optional(),
+    priority: casePrioritySchema.optional()
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: "Nenhum campo para atualizar"
+  });
+
 const getAuthUser = (request: FastifyRequest): AuthUser => {
   const user = request.user as Partial<AuthUser> | undefined;
   if (!user?.userId || !user?.tenantId || !user?.role || !user?.email) {
@@ -351,6 +414,610 @@ app.get(
       [auth.tenantId]
     );
     return { users: usersRes.rows };
+  }
+);
+
+app.post(
+  "/v1/contacts",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = contactCreateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    try {
+      const createdRes = await pool.query<{
+        id: string;
+        full_name: string;
+        email: string | null;
+        phone: string | null;
+        whatsapp_id: string | null;
+        status: "lead" | "client" | "archived";
+        tags_json: string[];
+        notes: string | null;
+        created_at: string;
+        updated_at: string;
+      }>(
+        `INSERT INTO contacts
+         (tenant_id, full_name, email, phone, whatsapp_id, status, tags_json, notes, created_by, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $9)
+         RETURNING id, full_name, email, phone, whatsapp_id, status, tags_json, notes, created_at, updated_at`,
+        [
+          auth.tenantId,
+          data.fullName,
+          data.email ?? null,
+          data.phone ?? null,
+          data.whatsappId ?? null,
+          data.status ?? "lead",
+          JSON.stringify(data.tags ?? []),
+          data.notes ?? null,
+          auth.userId
+        ]
+      );
+
+      const created = createdRes.rows[0];
+      await writeAuditEvent({
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "contact.create",
+        targetType: "contact",
+        targetId: created.id,
+        metadata: {
+          status: created.status,
+          fullName: created.full_name
+        }
+      });
+
+      return reply.status(201).send({ contact: created });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : "Erro interno";
+      if (msg.includes("idx_contacts_tenant_email_unique")) {
+        return reply.status(409).send({ message: "Email ja cadastrado no tenant" });
+      }
+      throw error;
+    }
+  }
+);
+
+app.get(
+  "/v1/contacts",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = listQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const limit = parsed.data.limit ?? 50;
+    const offset = parsed.data.offset ?? 0;
+    const search = parsed.data.search?.trim() || null;
+
+    const where = `
+      tenant_id = $1
+      AND (
+        $2::text IS NULL
+        OR full_name ILIKE '%' || $2 || '%'
+        OR COALESCE(email, '') ILIKE '%' || $2 || '%'
+        OR COALESCE(phone, '') ILIKE '%' || $2 || '%'
+      )`;
+
+    const itemsRes = await pool.query(
+      `SELECT id, full_name, email, phone, whatsapp_id, status, tags_json, notes, created_at, updated_at
+       FROM contacts
+       WHERE ${where}
+       ORDER BY created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [auth.tenantId, search, limit, offset]
+    );
+    const totalRes = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+       FROM contacts
+       WHERE ${where}`,
+      [auth.tenantId, search]
+    );
+
+    return {
+      items: itemsRes.rows,
+      total: Number(totalRes.rows[0].total),
+      limit,
+      offset
+    };
+  }
+);
+
+app.get(
+  "/v1/contacts/:contactId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { contactId?: string };
+    const contactId = params.contactId;
+    if (!contactId) {
+      return reply.status(400).send({ message: "contactId obrigatorio" });
+    }
+
+    const contactRes = await pool.query(
+      `SELECT id, full_name, email, phone, whatsapp_id, status, tags_json, notes, created_at, updated_at
+       FROM contacts
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [auth.tenantId, contactId]
+    );
+    if (!contactRes.rowCount) {
+      return reply.status(404).send({ message: "Contato nao encontrado" });
+    }
+
+    return { contact: contactRes.rows[0] };
+  }
+);
+
+app.patch(
+  "/v1/contacts/:contactId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { contactId?: string };
+    const contactId = params.contactId;
+    if (!contactId) {
+      return reply.status(400).send({ message: "contactId obrigatorio" });
+    }
+
+    const parsed = contactUpdateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    const existingRes = await pool.query<{
+      id: string;
+      full_name: string;
+      email: string | null;
+      phone: string | null;
+      whatsapp_id: string | null;
+      status: "lead" | "client" | "archived";
+      tags_json: string[];
+      notes: string | null;
+    }>(
+      `SELECT id, full_name, email, phone, whatsapp_id, status, tags_json, notes
+       FROM contacts
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [auth.tenantId, contactId]
+    );
+
+    if (!existingRes.rowCount) {
+      return reply.status(404).send({ message: "Contato nao encontrado" });
+    }
+
+    const existing = existingRes.rows[0];
+
+    try {
+      const updatedRes = await pool.query(
+        `UPDATE contacts
+         SET full_name = $3,
+             email = $4,
+             phone = $5,
+             whatsapp_id = $6,
+             status = $7,
+             tags_json = $8::jsonb,
+             notes = $9,
+             updated_by = $10,
+             updated_at = NOW()
+         WHERE tenant_id = $1 AND id = $2
+         RETURNING id, full_name, email, phone, whatsapp_id, status, tags_json, notes, created_at, updated_at`,
+        [
+          auth.tenantId,
+          contactId,
+          data.fullName ?? existing.full_name,
+          data.email === undefined ? existing.email : data.email,
+          data.phone === undefined ? existing.phone : data.phone,
+          data.whatsappId === undefined ? existing.whatsapp_id : data.whatsappId,
+          data.status ?? existing.status,
+          JSON.stringify(data.tags ?? existing.tags_json ?? []),
+          data.notes === undefined ? existing.notes : data.notes,
+          auth.userId
+        ]
+      );
+      const updated = updatedRes.rows[0];
+
+      await writeAuditEvent({
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "contact.update",
+        targetType: "contact",
+        targetId: contactId,
+        metadata: { changedFields: Object.keys(data) }
+      });
+
+      return { contact: updated };
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : "Erro interno";
+      if (msg.includes("idx_contacts_tenant_email_unique")) {
+        return reply.status(409).send({ message: "Email ja cadastrado no tenant" });
+      }
+      throw error;
+    }
+  }
+);
+
+app.delete(
+  "/v1/contacts/:contactId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { contactId?: string };
+    const contactId = params.contactId;
+    if (!contactId) {
+      return reply.status(400).send({ message: "contactId obrigatorio" });
+    }
+
+    const deletedRes = await pool.query<{
+      id: string;
+      full_name: string;
+    }>(
+      `DELETE FROM contacts
+       WHERE tenant_id = $1 AND id = $2
+       RETURNING id, full_name`,
+      [auth.tenantId, contactId]
+    );
+
+    if (!deletedRes.rowCount) {
+      return reply.status(404).send({ message: "Contato nao encontrado" });
+    }
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "contact.delete",
+      targetType: "contact",
+      targetId: contactId,
+      metadata: { fullName: deletedRes.rows[0].full_name }
+    });
+
+    return { success: true };
+  }
+);
+
+app.post(
+  "/v1/cases",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = caseCreateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    const contactRes = await pool.query(
+      `SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+      [auth.tenantId, data.contactId]
+    );
+    if (!contactRes.rowCount) {
+      return reply.status(400).send({ message: "contactId invalido para este tenant" });
+    }
+
+    const createdRes = await pool.query(
+      `INSERT INTO cases
+       (tenant_id, contact_id, title, description, practice_area, status, priority, created_by, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+       RETURNING id, contact_id, title, description, practice_area, status, priority, opened_at, closed_at, created_at, updated_at`,
+      [
+        auth.tenantId,
+        data.contactId,
+        data.title,
+        data.description ?? null,
+        data.practiceArea ?? null,
+        data.status ?? "open",
+        data.priority ?? "medium",
+        auth.userId
+      ]
+    );
+    const created = createdRes.rows[0];
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "case.create",
+      targetType: "case",
+      targetId: created.id,
+      metadata: {
+        title: created.title,
+        status: created.status,
+        priority: created.priority
+      }
+    });
+
+    return reply.status(201).send({ case: created });
+  }
+);
+
+app.get(
+  "/v1/cases",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = listQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const limit = parsed.data.limit ?? 50;
+    const offset = parsed.data.offset ?? 0;
+    const search = parsed.data.search?.trim() || null;
+
+    const where = `
+      c.tenant_id = $1
+      AND (
+        $2::text IS NULL
+        OR c.title ILIKE '%' || $2 || '%'
+        OR COALESCE(c.practice_area, '') ILIKE '%' || $2 || '%'
+        OR COALESCE(ct.full_name, '') ILIKE '%' || $2 || '%'
+      )`;
+
+    const itemsRes = await pool.query(
+      `SELECT c.id, c.contact_id, ct.full_name AS contact_name, c.title, c.description, c.practice_area, c.status, c.priority, c.opened_at, c.closed_at, c.created_at, c.updated_at
+       FROM cases c
+       LEFT JOIN contacts ct ON ct.id = c.contact_id
+       WHERE ${where}
+       ORDER BY c.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [auth.tenantId, search, limit, offset]
+    );
+    const totalRes = await pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+       FROM cases c
+       LEFT JOIN contacts ct ON ct.id = c.contact_id
+       WHERE ${where}`,
+      [auth.tenantId, search]
+    );
+
+    return {
+      items: itemsRes.rows,
+      total: Number(totalRes.rows[0].total),
+      limit,
+      offset
+    };
+  }
+);
+
+app.get(
+  "/v1/cases/:caseId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { caseId?: string };
+    const caseId = params.caseId;
+    if (!caseId) {
+      return reply.status(400).send({ message: "caseId obrigatorio" });
+    }
+
+    const caseRes = await pool.query(
+      `SELECT c.id, c.contact_id, ct.full_name AS contact_name, c.title, c.description, c.practice_area, c.status, c.priority, c.opened_at, c.closed_at, c.created_at, c.updated_at
+       FROM cases c
+       LEFT JOIN contacts ct ON ct.id = c.contact_id
+       WHERE c.tenant_id = $1 AND c.id = $2
+       LIMIT 1`,
+      [auth.tenantId, caseId]
+    );
+    if (!caseRes.rowCount) {
+      return reply.status(404).send({ message: "Caso nao encontrado" });
+    }
+
+    return { case: caseRes.rows[0] };
+  }
+);
+
+app.patch(
+  "/v1/cases/:caseId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { caseId?: string };
+    const caseId = params.caseId;
+    if (!caseId) {
+      return reply.status(400).send({ message: "caseId obrigatorio" });
+    }
+
+    const parsed = caseUpdateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    const existingRes = await pool.query<{
+      id: string;
+      contact_id: string;
+      title: string;
+      description: string | null;
+      practice_area: string | null;
+      status: "open" | "in_progress" | "waiting_client" | "closed" | "archived";
+      priority: "low" | "medium" | "high" | "urgent";
+      opened_at: string;
+      closed_at: string | null;
+    }>(
+      `SELECT id, contact_id, title, description, practice_area, status, priority, opened_at, closed_at
+       FROM cases
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [auth.tenantId, caseId]
+    );
+    if (!existingRes.rowCount) {
+      return reply.status(404).send({ message: "Caso nao encontrado" });
+    }
+    const existing = existingRes.rows[0];
+
+    if (data.contactId) {
+      const contactRes = await pool.query(
+        `SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+        [auth.tenantId, data.contactId]
+      );
+      if (!contactRes.rowCount) {
+        return reply.status(400).send({ message: "contactId invalido para este tenant" });
+      }
+    }
+
+    const nextStatus = data.status ?? existing.status;
+    const closedAt =
+      nextStatus === "closed"
+        ? existing.closed_at ?? new Date().toISOString()
+        : null;
+
+    const updatedRes = await pool.query(
+      `UPDATE cases
+       SET contact_id = $3,
+           title = $4,
+           description = $5,
+           practice_area = $6,
+           status = $7,
+           priority = $8,
+           closed_at = $9,
+           updated_by = $10,
+           updated_at = NOW()
+       WHERE tenant_id = $1 AND id = $2
+       RETURNING id, contact_id, title, description, practice_area, status, priority, opened_at, closed_at, created_at, updated_at`,
+      [
+        auth.tenantId,
+        caseId,
+        data.contactId ?? existing.contact_id,
+        data.title ?? existing.title,
+        data.description === undefined ? existing.description : data.description,
+        data.practiceArea === undefined ? existing.practice_area : data.practiceArea,
+        nextStatus,
+        data.priority ?? existing.priority,
+        closedAt,
+        auth.userId
+      ]
+    );
+    const updated = updatedRes.rows[0];
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "case.update",
+      targetType: "case",
+      targetId: caseId,
+      metadata: { changedFields: Object.keys(data), status: updated.status }
+    });
+
+    return { case: updated };
+  }
+);
+
+app.delete(
+  "/v1/cases/:caseId",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { caseId?: string };
+    const caseId = params.caseId;
+    if (!caseId) {
+      return reply.status(400).send({ message: "caseId obrigatorio" });
+    }
+
+    const deletedRes = await pool.query<{
+      id: string;
+      title: string;
+    }>(
+      `DELETE FROM cases
+       WHERE tenant_id = $1 AND id = $2
+       RETURNING id, title`,
+      [auth.tenantId, caseId]
+    );
+    if (!deletedRes.rowCount) {
+      return reply.status(404).send({ message: "Caso nao encontrado" });
+    }
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "case.delete",
+      targetType: "case",
+      targetId: caseId,
+      metadata: { title: deletedRes.rows[0].title }
+    });
+
+    return { success: true };
   }
 );
 
