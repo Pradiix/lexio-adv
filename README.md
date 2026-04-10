@@ -11,8 +11,10 @@ SaaS juridico para operacao de escritorios de advocacia, com IA confiavel, autom
 - `docs/ARQUITETURA_TECNICA_V1.md`
 - `docs/BACKLOG_SPRINT_1.md`
 - `docs/BACKLOG_SPRINT_2.md`
+- `docs/BACKLOG_SPRINT_3.md`
 - `docs/TESTE_LOCAL_SPRINT1.md`
 - `docs/TESTE_LOCAL_SPRINT2.md`
+- `docs/TESTE_LOCAL_SPRINT3.md`
 
 ## Infra local
 
@@ -50,3 +52,14 @@ Servicos previstos:
    - `GET /v1/cases/:caseId`
    - `PATCH /v1/cases/:caseId`
    - `DELETE /v1/cases/:caseId`
+   - `POST /v1/inbox/ingest`
+   - `GET /v1/inbox/conversations`
+   - `GET /v1/inbox/conversations/:conversationId`
+   - `PATCH /v1/inbox/conversations/:conversationId`
+   - `GET /v1/inbox/conversations/:conversationId/messages`
+   - `POST /v1/inbox/conversations/:conversationId/messages`
+   - `POST /v1/scheduling/requests`
+   - `GET /v1/scheduling/requests`
+   - `GET /v1/scheduling/requests/:operationId`
+   - `POST /v1/scheduling/requests/:operationId/confirm`
+   - `POST /v1/scheduling/requests/:operationId/reject`
