@@ -228,6 +228,11 @@ const schedulingRejectSchema = z.object({
   reason: z.string().min(3).max(300).optional()
 });
 
+const schedulingExpireSchema = z.object({
+  dryRun: z.boolean().optional(),
+  limit: z.coerce.number().int().min(1).max(1000).optional()
+});
+
 const aiContextQuerySchema = z.object({
   messageLimit: z.coerce.number().int().min(1).max(200).optional()
 });
@@ -255,6 +260,10 @@ const aiRespondSchema = z.object({
   model: z.string().min(2).max(120).optional(),
   saveAsMessage: z.boolean().optional(),
   metadata: z.record(z.string(), z.unknown()).optional()
+});
+
+const dashboardOverviewQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).optional()
 });
 
 const getAuthUser = (request: FastifyRequest): AuthUser => {
@@ -564,6 +573,15 @@ const generateAiReply = async (params: {
       error: message
     };
   }
+};
+
+const getDashboardPeriodRange = (days: number) => {
+  const dateTo = new Date();
+  const dateFrom = new Date(dateTo.getTime() - days * 24 * 60 * 60 * 1000);
+  return {
+    dateFromIso: dateFrom.toISOString(),
+    dateToIso: dateTo.toISOString()
+  };
 };
 
 app.get("/health", async () => {
@@ -2389,6 +2407,85 @@ app.post(
   }
 );
 
+app.post(
+  "/v1/scheduling/expire-pending",
+  {
+    preHandler: [authenticate, ensureTenantScope(), requireRoles(["owner", "manager"])]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = schedulingExpireSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const dryRun = parsed.data.dryRun ?? false;
+    const limit = parsed.data.limit ?? 500;
+
+    const candidatesRes = await pool.query<{ id: string; expires_at: string }>(
+      `SELECT id, expires_at
+       FROM scheduling_operations
+       WHERE tenant_id = $1
+         AND status = 'pending_confirmation'
+         AND expires_at < NOW()
+       ORDER BY expires_at ASC
+       LIMIT $2`,
+      [auth.tenantId, limit]
+    );
+
+    if (dryRun) {
+      return {
+        dryRun: true,
+        matched: candidatesRes.rowCount ?? 0,
+        operationIds: candidatesRes.rows.map((r) => r.id)
+      };
+    }
+
+    if (!candidatesRes.rowCount) {
+      return { expired: 0, operationIds: [] };
+    }
+
+    const ids = candidatesRes.rows.map((r) => r.id);
+    const updateRes = await pool.query<{ id: string }>(
+      `UPDATE scheduling_operations
+       SET status = 'expired',
+           result_json = result_json || $3::jsonb,
+           updated_at = NOW()
+       WHERE tenant_id = $1
+         AND id = ANY($2::uuid[])
+         AND status = 'pending_confirmation'
+       RETURNING id`,
+      [
+        auth.tenantId,
+        ids,
+        JSON.stringify({
+          expiredBySweep: true,
+          expiredByUserId: auth.userId,
+          expiredAt: new Date().toISOString()
+        })
+      ]
+    );
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "scheduling.request.expire_sweep",
+      targetType: "scheduling_operation",
+      targetId: "batch",
+      metadata: {
+        expiredCount: updateRes.rowCount ?? 0
+      }
+    });
+
+    return {
+      expired: updateRes.rowCount ?? 0,
+      operationIds: updateRes.rows.map((r) => r.id)
+    };
+  }
+);
+
 app.get(
   "/v1/ai/conversations/:conversationId/context",
   {
@@ -2859,6 +2956,234 @@ app.post(
       generation,
       outputMessageId
     });
+  }
+);
+
+app.get(
+  "/v1/dashboard/overview",
+  {
+    preHandler: [authenticate, ensureTenantScope(), requireRoles(["owner", "manager"])]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = dashboardOverviewQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const days = parsed.data.days ?? 30;
+    const { dateFromIso, dateToIso } = getDashboardPeriodRange(days);
+
+    const [
+      contactsTotalRes,
+      contactsPeriodRes,
+      casesOpenRes,
+      casesPeriodRes,
+      messagesPeriodRes,
+      conversationsOpenRes,
+      schedulingStatusRes,
+      aiPeriodRes,
+      responseCoverageRes
+    ] = await Promise.all([
+      pool.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total
+         FROM contacts
+         WHERE tenant_id = $1`,
+        [auth.tenantId]
+      ),
+      pool.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total
+         FROM contacts
+         WHERE tenant_id = $1 AND created_at BETWEEN $2 AND $3`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      ),
+      pool.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total
+         FROM cases
+         WHERE tenant_id = $1
+           AND status IN ('open', 'in_progress', 'waiting_client')`,
+        [auth.tenantId]
+      ),
+      pool.query<{ total: string; closed: string }>(
+        `SELECT COUNT(*)::text AS total,
+                COUNT(*) FILTER (WHERE status = 'closed')::text AS closed
+         FROM cases
+         WHERE tenant_id = $1
+           AND created_at BETWEEN $2 AND $3`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      ),
+      pool.query<{ total: string; inbound: string; outbound: string }>(
+        `SELECT COUNT(*)::text AS total,
+                COUNT(*) FILTER (WHERE direction = 'inbound')::text AS inbound,
+                COUNT(*) FILTER (WHERE direction = 'outbound')::text AS outbound
+         FROM conversation_messages
+         WHERE tenant_id = $1
+           AND occurred_at BETWEEN $2 AND $3`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      ),
+      pool.query<{ total: string }>(
+        `SELECT COUNT(*)::text AS total
+         FROM conversations
+         WHERE tenant_id = $1
+           AND status = 'open'`,
+        [auth.tenantId]
+      ),
+      pool.query<{ status: string; total: string }>(
+        `SELECT status, COUNT(*)::text AS total
+         FROM scheduling_operations
+         WHERE tenant_id = $1
+           AND updated_at BETWEEN $2 AND $3
+         GROUP BY status`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      ),
+      pool.query<{ total: string; fallback: string }>(
+        `SELECT COUNT(*)::text AS total,
+                COUNT(*) FILTER (WHERE used_fallback = true)::text AS fallback
+         FROM ai_generation_logs
+         WHERE tenant_id = $1
+           AND created_at BETWEEN $2 AND $3`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      ),
+      pool.query<{ inbound_conversations: string; responded_conversations: string }>(
+        `WITH inbound_conversations AS (
+           SELECT DISTINCT conversation_id
+           FROM conversation_messages
+           WHERE tenant_id = $1
+             AND direction = 'inbound'
+             AND occurred_at BETWEEN $2 AND $3
+         ),
+         responded_conversations AS (
+           SELECT DISTINCT ic.conversation_id
+           FROM inbound_conversations ic
+           JOIN conversation_messages m
+             ON m.conversation_id = ic.conversation_id
+            AND m.tenant_id = $1
+            AND m.direction = 'outbound'
+         )
+         SELECT
+           (SELECT COUNT(*)::text FROM inbound_conversations) AS inbound_conversations,
+           (SELECT COUNT(*)::text FROM responded_conversations) AS responded_conversations`,
+        [auth.tenantId, dateFromIso, dateToIso]
+      )
+    ]);
+
+    const schedulingByStatus: Record<string, number> = {};
+    for (const row of schedulingStatusRes.rows) {
+      schedulingByStatus[row.status] = Number(row.total);
+    }
+
+    const aiTotal = Number(aiPeriodRes.rows[0]?.total ?? 0);
+    const aiFallback = Number(aiPeriodRes.rows[0]?.fallback ?? 0);
+    const inboundConversations = Number(
+      responseCoverageRes.rows[0]?.inbound_conversations ?? 0
+    );
+    const respondedConversations = Number(
+      responseCoverageRes.rows[0]?.responded_conversations ?? 0
+    );
+
+    return {
+      period: {
+        days,
+        dateFrom: dateFromIso,
+        dateTo: dateToIso
+      },
+      contacts: {
+        total: Number(contactsTotalRes.rows[0]?.total ?? 0),
+        newInPeriod: Number(contactsPeriodRes.rows[0]?.total ?? 0)
+      },
+      cases: {
+        openNow: Number(casesOpenRes.rows[0]?.total ?? 0),
+        createdInPeriod: Number(casesPeriodRes.rows[0]?.total ?? 0),
+        closedInPeriod: Number(casesPeriodRes.rows[0]?.closed ?? 0)
+      },
+      inbox: {
+        conversationsOpenNow: Number(conversationsOpenRes.rows[0]?.total ?? 0),
+        messagesInPeriod: Number(messagesPeriodRes.rows[0]?.total ?? 0),
+        inboundInPeriod: Number(messagesPeriodRes.rows[0]?.inbound ?? 0),
+        outboundInPeriod: Number(messagesPeriodRes.rows[0]?.outbound ?? 0),
+        responseCoveragePercent:
+          inboundConversations === 0
+            ? 100
+            : Math.round((respondedConversations / inboundConversations) * 10000) /
+              100
+      },
+      scheduling: {
+        byStatus: schedulingByStatus,
+        pendingNow: Number(schedulingByStatus.pending_confirmation ?? 0),
+        executedInPeriod: Number(schedulingByStatus.executed ?? 0),
+        rejectedInPeriod: Number(schedulingByStatus.rejected ?? 0),
+        expiredInPeriod: Number(schedulingByStatus.expired ?? 0)
+      },
+      ai: {
+        generationsInPeriod: aiTotal,
+        fallbackInPeriod: aiFallback,
+        fallbackRatePercent:
+          aiTotal === 0 ? 0 : Math.round((aiFallback / aiTotal) * 10000) / 100
+      }
+    };
+  }
+);
+
+app.get(
+  "/v1/dashboard/channels",
+  {
+    preHandler: [authenticate, ensureTenantScope(), requireRoles(["owner", "manager"])]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const parsed = dashboardOverviewQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const days = parsed.data.days ?? 30;
+    const { dateFromIso, dateToIso } = getDashboardPeriodRange(days);
+
+    const messagesByChannelRes = await pool.query<{ channel: string; total: string }>(
+      `SELECT source_channel AS channel, COUNT(*)::text AS total
+       FROM conversation_messages
+       WHERE tenant_id = $1
+         AND occurred_at BETWEEN $2 AND $3
+       GROUP BY source_channel
+       ORDER BY COUNT(*) DESC`,
+      [auth.tenantId, dateFromIso, dateToIso]
+    );
+
+    const conversationsByChannelRes = await pool.query<{
+      channel: string;
+      total: string;
+      open_total: string;
+    }>(
+      `SELECT channel,
+              COUNT(*)::text AS total,
+              COUNT(*) FILTER (WHERE status = 'open')::text AS open_total
+       FROM conversations
+       WHERE tenant_id = $1
+       GROUP BY channel
+       ORDER BY COUNT(*) DESC`,
+      [auth.tenantId]
+    );
+
+    return {
+      period: {
+        days,
+        dateFrom: dateFromIso,
+        dateTo: dateToIso
+      },
+      messagesByChannel: messagesByChannelRes.rows.map((row) => ({
+        channel: row.channel,
+        total: Number(row.total)
+      })),
+      conversationsByChannel: conversationsByChannelRes.rows.map((row) => ({
+        channel: row.channel,
+        total: Number(row.total),
+        openTotal: Number(row.open_total)
+      }))
+    };
   }
 );
 

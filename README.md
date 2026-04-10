@@ -13,10 +13,12 @@ SaaS juridico para operacao de escritorios de advocacia, com IA confiavel, autom
 - `docs/BACKLOG_SPRINT_2.md`
 - `docs/BACKLOG_SPRINT_3.md`
 - `docs/BACKLOG_SPRINT_4.md`
+- `docs/BACKLOG_SPRINT_5.md`
 - `docs/TESTE_LOCAL_SPRINT1.md`
 - `docs/TESTE_LOCAL_SPRINT2.md`
 - `docs/TESTE_LOCAL_SPRINT3.md`
 - `docs/TESTE_LOCAL_SPRINT4.md`
+- `docs/TESTE_LOCAL_SPRINT5.md`
 
 ## Infra local
 
@@ -70,3 +72,6 @@ Servicos previstos:
    - `POST /v1/ai/conversations/:conversationId/memory/snapshots`
    - `GET /v1/ai/conversations/:conversationId/generations`
    - `POST /v1/ai/conversations/:conversationId/respond`
+   - `POST /v1/scheduling/expire-pending`
+   - `GET /v1/dashboard/overview`
+   - `GET /v1/dashboard/channels`
