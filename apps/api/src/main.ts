@@ -21,6 +21,10 @@ const app = Fastify({ logger: true });
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? "0.0.0.0";
 const jwtSecret = process.env.JWT_SECRET ?? "lexio_dev_change_me";
+const openAiApiKey = process.env.OPENAI_API_KEY?.trim() || null;
+const openAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini";
+const openAiBaseUrl =
+  process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1";
 
 const databaseUrl =
   process.env.DATABASE_URL ??
@@ -224,6 +228,35 @@ const schedulingRejectSchema = z.object({
   reason: z.string().min(3).max(300).optional()
 });
 
+const aiContextQuerySchema = z.object({
+  messageLimit: z.coerce.number().int().min(1).max(200).optional()
+});
+
+const aiMemoryListSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional()
+});
+
+const aiMemorySnapshotCreateSchema = z.object({
+  summaryText: z.string().min(10).max(10000),
+  keyFacts: z.array(z.string().min(1).max(300)).optional(),
+  openTasks: z.array(z.string().min(1).max(300)).optional(),
+  riskFlags: z.array(z.string().min(1).max(300)).optional(),
+  intent: z.string().min(2).max(180).optional().nullable(),
+  sentiment: z.enum(["positive", "neutral", "negative", "urgent"]).optional(),
+  confidence: z.number().min(0).max(1).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+});
+
+const aiRespondSchema = z.object({
+  userMessage: z.string().min(1).max(10000).optional(),
+  systemInstruction: z.string().min(5).max(6000).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  maxOutputTokens: z.number().int().min(64).max(2000).optional(),
+  model: z.string().min(2).max(120).optional(),
+  saveAsMessage: z.boolean().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+});
+
 const getAuthUser = (request: FastifyRequest): AuthUser => {
   const user = request.user as Partial<AuthUser> | undefined;
   if (!user?.userId || !user?.tenantId || !user?.role || !user?.email) {
@@ -368,6 +401,169 @@ const generateConfirmationCode = () => {
     code += alphabet[bytes[i] % alphabet.length];
   }
   return code;
+};
+
+const buildFallbackAiReply = (userMessage?: string) => {
+  if (userMessage && userMessage.trim().length > 0) {
+    return `Recebi sua mensagem: "${userMessage.trim()}". Vou registrar seu pedido e um membro da equipe juridica vai confirmar os proximos passos com voce em instantes.`;
+  }
+  return "Recebi sua solicitacao e vou encaminhar para a equipe juridica confirmar os proximos passos.";
+};
+
+const extractResponseTextFromOpenAiPayload = (payload: unknown): string | null => {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const data = payload as Record<string, unknown>;
+  if (typeof data.output_text === "string" && data.output_text.trim().length > 0) {
+    return data.output_text.trim();
+  }
+
+  const output = data.output;
+  if (!Array.isArray(output)) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const content = (item as Record<string, unknown>).content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (const contentItem of content) {
+      if (!contentItem || typeof contentItem !== "object") {
+        continue;
+      }
+      const maybeText = (contentItem as Record<string, unknown>).text;
+      if (typeof maybeText === "string" && maybeText.trim().length > 0) {
+        parts.push(maybeText.trim());
+      }
+    }
+  }
+
+  if (!parts.length) {
+    return null;
+  }
+  return parts.join("\n").trim();
+};
+
+const generateAiReply = async (params: {
+  systemInstruction: string;
+  history: Array<{ role: "user" | "assistant"; text: string }>;
+  model?: string;
+  temperature?: number;
+  maxOutputTokens?: number;
+  userMessage?: string;
+}) => {
+  const fallbackText = buildFallbackAiReply(params.userMessage);
+  const selectedModel = params.model?.trim() || openAiModel;
+
+  if (!openAiApiKey) {
+    return {
+      text: fallbackText,
+      provider: "fallback",
+      model: selectedModel,
+      usedFallback: true,
+      finishReason: "fallback_no_api_key",
+      latencyMs: 0,
+      requestPayload: null,
+      responsePayload: null
+    };
+  }
+
+  const inputPayload = [
+    {
+      role: "system",
+      content: [{ type: "input_text", text: params.systemInstruction }]
+    },
+    ...params.history.map((item) => ({
+      role: item.role,
+      content: [{ type: "input_text", text: item.text }]
+    }))
+  ];
+
+  const requestPayload: Record<string, unknown> = {
+    model: selectedModel,
+    input: inputPayload,
+    temperature: params.temperature ?? 0.2,
+    max_output_tokens: params.maxOutputTokens ?? 500
+  };
+
+  const startedAt = Date.now();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const response = await fetch(`${openAiBaseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${openAiApiKey}`
+      },
+      body: JSON.stringify(requestPayload),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    const responseBody = (await response.json()) as Record<string, unknown>;
+    const latencyMs = Date.now() - startedAt;
+    if (!response.ok) {
+      return {
+        text: fallbackText,
+        provider: "openai",
+        model: selectedModel,
+        usedFallback: true,
+        finishReason: "fallback_http_error",
+        latencyMs,
+        requestPayload,
+        responsePayload: responseBody,
+        error: `OpenAI HTTP ${response.status}`
+      };
+    }
+
+    const replyText = extractResponseTextFromOpenAiPayload(responseBody);
+    if (!replyText) {
+      return {
+        text: fallbackText,
+        provider: "openai",
+        model: selectedModel,
+        usedFallback: true,
+        finishReason: "fallback_empty_response",
+        latencyMs,
+        requestPayload,
+        responsePayload: responseBody
+      };
+    }
+
+    return {
+      text: replyText,
+      provider: "openai",
+      model: selectedModel,
+      usedFallback: false,
+      finishReason:
+        typeof responseBody.status === "string" ? responseBody.status : "completed",
+      latencyMs,
+      requestPayload,
+      responsePayload: responseBody
+    };
+  } catch (error: unknown) {
+    const latencyMs = Date.now() - startedAt;
+    const message = error instanceof Error ? error.message : "Erro ao chamar OpenAI";
+    return {
+      text: fallbackText,
+      provider: "openai",
+      model: selectedModel,
+      usedFallback: true,
+      finishReason: "fallback_runtime_error",
+      latencyMs,
+      requestPayload,
+      responsePayload: null,
+      error: message
+    };
+  }
 };
 
 app.get("/health", async () => {
@@ -2194,6 +2390,479 @@ app.post(
 );
 
 app.get(
+  "/v1/ai/conversations/:conversationId/context",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { conversationId?: string };
+    const conversationId = params.conversationId;
+    if (!conversationId) {
+      return reply.status(400).send({ message: "conversationId obrigatorio" });
+    }
+
+    const queryParsed = aiContextQuerySchema.safeParse(request.query ?? {});
+    if (!queryParsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: queryParsed.error.issues
+      });
+    }
+    const messageLimit = queryParsed.data.messageLimit ?? 30;
+
+    const conversationRes = await pool.query(
+      `SELECT c.id, c.contact_id, ct.full_name AS contact_name, ct.email AS contact_email, ct.phone AS contact_phone, c.channel, c.external_thread_id, c.status, c.last_message_at, c.created_at, c.updated_at
+       FROM conversations c
+       LEFT JOIN contacts ct ON ct.id = c.contact_id
+       WHERE c.tenant_id = $1 AND c.id = $2
+       LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+    if (!conversationRes.rowCount) {
+      return reply.status(404).send({ message: "Conversa nao encontrada" });
+    }
+    const conversation = conversationRes.rows[0];
+
+    const latestMemoryRes = await pool.query(
+      `SELECT id, summary_text, key_facts_json, open_tasks_json, risk_flags_json, intent, sentiment, confidence, metadata_json, created_at
+       FROM ai_conversation_memory_snapshots
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+
+    const messagesRes = await pool.query(
+      `SELECT id, direction, sender_type, source_channel, external_message_id, message_text, metadata_json, occurred_at, created_at
+       FROM conversation_messages
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY occurred_at DESC
+       LIMIT $3`,
+      [auth.tenantId, conversationId, messageLimit]
+    );
+
+    const recentMessages = messagesRes.rows.reverse();
+
+    return {
+      conversation,
+      latestMemory: latestMemoryRes.rows[0] ?? null,
+      recentMessages,
+      messageLimit
+    };
+  }
+);
+
+app.get(
+  "/v1/ai/conversations/:conversationId/memory/snapshots",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { conversationId?: string };
+    const conversationId = params.conversationId;
+    if (!conversationId) {
+      return reply.status(400).send({ message: "conversationId obrigatorio" });
+    }
+
+    const parsed = aiMemoryListSchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const limit = parsed.data.limit ?? 20;
+
+    const conversationRes = await pool.query(
+      `SELECT id FROM conversations WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+    if (!conversationRes.rowCount) {
+      return reply.status(404).send({ message: "Conversa nao encontrada" });
+    }
+
+    const snapshotsRes = await pool.query(
+      `SELECT id, summary_text, key_facts_json, open_tasks_json, risk_flags_json, intent, sentiment, confidence, metadata_json, created_at
+       FROM ai_conversation_memory_snapshots
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [auth.tenantId, conversationId, limit]
+    );
+    return {
+      snapshots: snapshotsRes.rows,
+      limit
+    };
+  }
+);
+
+app.post(
+  "/v1/ai/conversations/:conversationId/memory/snapshots",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { conversationId?: string };
+    const conversationId = params.conversationId;
+    if (!conversationId) {
+      return reply.status(400).send({ message: "conversationId obrigatorio" });
+    }
+
+    const parsed = aiMemorySnapshotCreateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    const conversationRes = await pool.query<{ id: string; contact_id: string | null }>(
+      `SELECT id, contact_id
+       FROM conversations
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+    if (!conversationRes.rowCount) {
+      return reply.status(404).send({ message: "Conversa nao encontrada" });
+    }
+    const conversation = conversationRes.rows[0];
+
+    const snapshotRes = await pool.query(
+      `INSERT INTO ai_conversation_memory_snapshots
+       (tenant_id, conversation_id, contact_id, summary_text, key_facts_json, open_tasks_json, risk_flags_json, intent, sentiment, confidence, metadata_json, created_by)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8, $9, $10, $11::jsonb, $12)
+       RETURNING id, summary_text, key_facts_json, open_tasks_json, risk_flags_json, intent, sentiment, confidence, metadata_json, created_at`,
+      [
+        auth.tenantId,
+        conversation.id,
+        conversation.contact_id,
+        data.summaryText,
+        JSON.stringify(data.keyFacts ?? []),
+        JSON.stringify(data.openTasks ?? []),
+        JSON.stringify(data.riskFlags ?? []),
+        data.intent ?? null,
+        data.sentiment ?? null,
+        data.confidence ?? 0.5,
+        JSON.stringify(data.metadata ?? {}),
+        auth.userId
+      ]
+    );
+    const snapshot = snapshotRes.rows[0];
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "ai.memory.snapshot.create",
+      targetType: "conversation",
+      targetId: conversation.id,
+      metadata: {
+        snapshotId: snapshot.id,
+        sentiment: snapshot.sentiment,
+        confidence: snapshot.confidence
+      }
+    });
+
+    return reply.status(201).send({ snapshot });
+  }
+);
+
+app.get(
+  "/v1/ai/conversations/:conversationId/generations",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { conversationId?: string };
+    const conversationId = params.conversationId;
+    if (!conversationId) {
+      return reply.status(400).send({ message: "conversationId obrigatorio" });
+    }
+
+    const parsed = aiMemoryListSchema.safeParse(request.query ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Query invalida",
+        issues: parsed.error.issues
+      });
+    }
+    const limit = parsed.data.limit ?? 20;
+
+    const conversationRes = await pool.query(
+      `SELECT id FROM conversations WHERE tenant_id = $1 AND id = $2 LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+    if (!conversationRes.rowCount) {
+      return reply.status(404).send({ message: "Conversa nao encontrada" });
+    }
+
+    const logsRes = await pool.query(
+      `SELECT id, provider, model, used_fallback, memory_snapshot_id, output_text, finish_reason, latency_ms, metadata_json, output_message_id, created_at
+       FROM ai_generation_logs
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [auth.tenantId, conversationId, limit]
+    );
+
+    return {
+      generations: logsRes.rows,
+      limit
+    };
+  }
+);
+
+app.post(
+  "/v1/ai/conversations/:conversationId/respond",
+  {
+    preHandler: [
+      authenticate,
+      ensureTenantScope(),
+      requireRoles(["owner", "manager", "agent"])
+    ]
+  },
+  async (request, reply) => {
+    const auth = getAuthUser(request);
+    const params = request.params as { conversationId?: string };
+    const conversationId = params.conversationId;
+    if (!conversationId) {
+      return reply.status(400).send({ message: "conversationId obrigatorio" });
+    }
+
+    const parsed = aiRespondSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        message: "Payload invalido",
+        issues: parsed.error.issues
+      });
+    }
+    const data = parsed.data;
+
+    const conversationRes = await pool.query<{
+      id: string;
+      contact_id: string | null;
+      channel: "whatsapp" | "email" | "webchat" | "manual";
+    }>(
+      `SELECT id, contact_id, channel
+       FROM conversations
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [auth.tenantId, conversationId]
+    );
+    if (!conversationRes.rowCount) {
+      return reply.status(404).send({ message: "Conversa nao encontrada" });
+    }
+    const conversation = conversationRes.rows[0];
+
+    const nowIso = new Date().toISOString();
+    if (data.userMessage) {
+      await pool.query(
+        `INSERT INTO conversation_messages
+         (tenant_id, conversation_id, contact_id, source_channel, direction, sender_type, message_text, attachments_json, metadata_json, occurred_at, created_by)
+         VALUES ($1, $2, $3, $4, 'inbound', 'client', $5, '[]'::jsonb, $6::jsonb, $7, $8)`,
+        [
+          auth.tenantId,
+          conversation.id,
+          conversation.contact_id,
+          conversation.channel,
+          data.userMessage,
+          JSON.stringify({ origin: "ai.respond.userMessage", ...(data.metadata ?? {}) }),
+          nowIso,
+          auth.userId
+        ]
+      );
+    }
+
+    const memoryRes = await pool.query<{
+      id: string;
+      summary_text: string;
+      key_facts_json: string[];
+      open_tasks_json: string[];
+      risk_flags_json: string[];
+      intent: string | null;
+    }>(
+      `SELECT id, summary_text, key_facts_json, open_tasks_json, risk_flags_json, intent
+       FROM ai_conversation_memory_snapshots
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [auth.tenantId, conversation.id]
+    );
+    const latestMemory = memoryRes.rows[0] ?? null;
+
+    const historyRes = await pool.query<{
+      direction: "inbound" | "outbound" | "system";
+      sender_type: "client" | "agent" | "ai" | "system";
+      message_text: string;
+      occurred_at: string;
+    }>(
+      `SELECT direction, sender_type, message_text, occurred_at
+       FROM conversation_messages
+       WHERE tenant_id = $1 AND conversation_id = $2
+       ORDER BY occurred_at DESC
+       LIMIT 30`,
+      [auth.tenantId, conversation.id]
+    );
+
+    const historyForAi = historyRes.rows
+      .reverse()
+      .map((row) => {
+        const role: "user" | "assistant" =
+          row.sender_type === "client" || row.direction === "inbound"
+            ? "user"
+            : "assistant";
+        return {
+          role,
+          text: row.message_text
+        };
+      })
+      .filter((item) => item.text.trim().length > 0);
+
+    const systemSections = [
+      "Voce e assistente virtual de um escritorio juridico brasileiro.",
+      "Nunca invente fatos. Se faltar dado, diga que precisa confirmar com a equipe.",
+      "Se houver pedido de agendamento, oriente uso do fluxo deterministico de confirmacao.",
+      "Responda em portugues brasileiro de forma objetiva e cordial."
+    ];
+    if (latestMemory) {
+      systemSections.push(`Resumo de contexto: ${latestMemory.summary_text}`);
+      if (Array.isArray(latestMemory.key_facts_json) && latestMemory.key_facts_json.length) {
+        systemSections.push(`Fatos-chave: ${latestMemory.key_facts_json.join(" | ")}`);
+      }
+      if (Array.isArray(latestMemory.open_tasks_json) && latestMemory.open_tasks_json.length) {
+        systemSections.push(`Pendencias: ${latestMemory.open_tasks_json.join(" | ")}`);
+      }
+      if (Array.isArray(latestMemory.risk_flags_json) && latestMemory.risk_flags_json.length) {
+        systemSections.push(`Alertas: ${latestMemory.risk_flags_json.join(" | ")}`);
+      }
+      if (latestMemory.intent) {
+        systemSections.push(`Intencao principal: ${latestMemory.intent}`);
+      }
+    }
+    if (data.systemInstruction) {
+      systemSections.push(`Instrucao operacional: ${data.systemInstruction}`);
+    }
+    const systemInstruction = systemSections.join("\n");
+
+    const aiResult = await generateAiReply({
+      systemInstruction,
+      history: historyForAi,
+      model: data.model,
+      temperature: data.temperature,
+      maxOutputTokens: data.maxOutputTokens,
+      userMessage: data.userMessage
+    });
+
+    const saveAsMessage = data.saveAsMessage ?? true;
+    let outputMessageId: string | null = null;
+
+    if (saveAsMessage) {
+      const outputMessageRes = await pool.query<{ id: string }>(
+        `INSERT INTO conversation_messages
+         (tenant_id, conversation_id, contact_id, source_channel, direction, sender_type, message_text, attachments_json, metadata_json, occurred_at, created_by)
+         VALUES ($1, $2, $3, $4, 'outbound', 'ai', $5, '[]'::jsonb, $6::jsonb, $7, $8)
+         RETURNING id`,
+        [
+          auth.tenantId,
+          conversation.id,
+          conversation.contact_id,
+          conversation.channel,
+          aiResult.text,
+          JSON.stringify({
+            provider: aiResult.provider,
+            model: aiResult.model,
+            usedFallback: aiResult.usedFallback
+          }),
+          new Date().toISOString(),
+          auth.userId
+        ]
+      );
+      outputMessageId = outputMessageRes.rows[0].id;
+
+      await pool.query(
+        `UPDATE conversations
+         SET status = 'open',
+             last_message_at = NOW(),
+             updated_by = $3,
+             updated_at = NOW()
+         WHERE tenant_id = $1 AND id = $2`,
+        [auth.tenantId, conversation.id, auth.userId]
+      );
+    }
+
+    const generationRes = await pool.query(
+      `INSERT INTO ai_generation_logs
+       (tenant_id, conversation_id, contact_id, provider, model, used_fallback, input_messages_json, memory_snapshot_id, output_text, finish_reason, latency_ms, metadata_json, output_message_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb, $13, $14)
+       RETURNING id, provider, model, used_fallback, output_text, finish_reason, latency_ms, output_message_id, created_at`,
+      [
+        auth.tenantId,
+        conversation.id,
+        conversation.contact_id,
+        aiResult.provider,
+        aiResult.model,
+        aiResult.usedFallback,
+        JSON.stringify(historyForAi),
+        latestMemory?.id ?? null,
+        aiResult.text,
+        aiResult.finishReason ?? null,
+        aiResult.latencyMs ?? null,
+        JSON.stringify({
+          openAiError: aiResult.error ?? null,
+          hasApiKey: Boolean(openAiApiKey),
+          metadata: data.metadata ?? {},
+          responsePayload: aiResult.responsePayload ?? null
+        }),
+        outputMessageId,
+        auth.userId
+      ]
+    );
+    const generation = generationRes.rows[0];
+
+    await writeAuditEvent({
+      tenantId: auth.tenantId,
+      actorUserId: auth.userId,
+      action: "ai.response.generate",
+      targetType: "conversation",
+      targetId: conversation.id,
+      metadata: {
+        provider: generation.provider,
+        model: generation.model,
+        usedFallback: generation.used_fallback,
+        generationId: generation.id
+      }
+    });
+
+    return reply.status(201).send({
+      replyText: aiResult.text,
+      generation,
+      outputMessageId
+    });
+  }
+);
+
+app.get(
   "/v1/audit-events",
   {
     preHandler: [
@@ -2244,7 +2913,26 @@ app.get(
 app.setErrorHandler((error, _request, reply) => {
   app.log.error(error);
   if (!reply.sent) {
-    reply.status(500).send({ message: "Erro interno" });
+    const maybeStatus =
+      typeof (error as { statusCode?: unknown }).statusCode === "number"
+        ? Number((error as { statusCode: number }).statusCode)
+        : 500;
+    const statusCode =
+      maybeStatus >= 400 && maybeStatus <= 599 ? maybeStatus : 500;
+    const errorMessage =
+      error instanceof Error
+        ? error.message
+        : typeof error === "object" &&
+            error !== null &&
+            "message" in error &&
+            typeof (error as { message: unknown }).message === "string"
+          ? (error as { message: string }).message
+          : null;
+    const message =
+      statusCode >= 500
+        ? "Erro interno"
+        : errorMessage || "Erro de requisicao";
+    reply.status(statusCode).send({ message });
   }
 });
 
